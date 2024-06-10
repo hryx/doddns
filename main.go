@@ -19,7 +19,7 @@ import (
 type config struct {
 	TokenFile     string  `json:"token_file"`
 	Domain        string  `json:"domain"`
-	Subdomain     string  `json:"subdomain"`
+	Hostname      string  `json:"hostname"`
 	PeriodSeconds float64 `json:"period"`
 	IPv4          bool    `json:"ipv4"`
 	IPv6          bool    `json:"ipv6"`
@@ -43,7 +43,7 @@ func main() {
 		log.Fatal("at least one must be set to true: ipv4, ipv6")
 	}
 
-	fqdn := fmt.Sprintf("%s.%s", cfg.Subdomain, cfg.Domain)
+	fqdn := fmt.Sprintf("%s.%s", cfg.Hostname, cfg.Domain)
 	log.Printf("fully qualified domain set to %s", fqdn)
 
 	ctx := context.Background()
@@ -89,7 +89,7 @@ func main() {
 	log.Printf("period set to %s", dur)
 	ticker := time.NewTicker(dur)
 	for {
-		loopMain(client, cfg.Domain, cfg.Subdomain, records4, records6)
+		loopMain(client, cfg.Domain, cfg.Hostname, records4, records6)
 		<-ticker.C
 	}
 }
@@ -107,10 +107,10 @@ func mustReadFile(path string) []byte {
 
 var lastIPv4, lastIPv6 string
 
-func loopMain(client *godo.Client, domain, subdomain string, records4, records6 []int) {
+func loopMain(client *godo.Client, domain, hostname string, records4, records6 []int) {
 	updateRecords(client, updateRecordsInput{
 		domain:             domain,
-		subdomain:          subdomain,
+		hostname:           hostname,
 		recordIDs:          records4,
 		recordType:         "A",
 		publicIPServiceURL: "https://api.ipify.org",
@@ -118,7 +118,7 @@ func loopMain(client *godo.Client, domain, subdomain string, records4, records6 
 	})
 	updateRecords(client, updateRecordsInput{
 		domain:             domain,
-		subdomain:          subdomain,
+		hostname:           hostname,
 		recordIDs:          records6,
 		recordType:         "AAAA",
 		publicIPServiceURL: "https://api6.ipify.org",
@@ -127,7 +127,7 @@ func loopMain(client *godo.Client, domain, subdomain string, records4, records6 
 }
 
 type updateRecordsInput struct {
-	domain, subdomain  string
+	domain, hostname   string
 	recordIDs          []int
 	recordType         string
 	lastIP             *string
@@ -151,7 +151,7 @@ func updateRecords(client *godo.Client, in updateRecordsInput) {
 		ctx := context.Background()
 		_, _, err := client.Domains.EditRecord(ctx, in.domain, recID, &godo.DomainRecordEditRequest{
 			Type: in.recordType,
-			Name: in.subdomain,
+			Name: in.hostname,
 			Data: ip,
 		})
 		if err != nil {
