@@ -26,7 +26,7 @@ Example:
 {
     "token_file": "/home/me/my_doddns_token",
     "domain": "example.com",
-    "subdomain": "rhombus",
+    "hostname": "rhombus",
     "period": 600,
     "ipv4": true,
     "ipv6": false
