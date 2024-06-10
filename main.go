@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -20,6 +21,8 @@ type config struct {
 	Domain        string  `json:"domain"`
 	Subdomain     string  `json:"subdomain"`
 	PeriodSeconds float64 `json:"period"`
+	IPv4          bool    `json:"ipv4"`
+	IPv6          bool    `json:"ipv6"`
 }
 
 func main() {
@@ -36,28 +39,57 @@ func main() {
 		log.Fatal("API key is empty")
 	}
 
-	client := godo.NewFromToken(key)
-	ctx := context.Background()
+	if !cfg.IPv4 && !cfg.IPv6 {
+		log.Fatal("at least one must be set to true: ipv4, ipv6")
+	}
+
 	fqdn := fmt.Sprintf("%s.%s", cfg.Subdomain, cfg.Domain)
-	recs, _, err := client.Domains.RecordsByTypeAndName(ctx, cfg.Domain, "A", fqdn, nil)
-	if err != nil {
-		log.Fatalf("get DNS records by domain name: %v", err)
+	log.Printf("fully qualified domain set to %s", fqdn)
+
+	ctx := context.Background()
+	client := godo.NewFromToken(key)
+	opt := &godo.ListOptions{}
+	var records4, records6 []int
+	for {
+		recs, res, err := client.Domains.RecordsByName(ctx, cfg.Domain, fqdn, opt)
+		if err != nil {
+			log.Fatalf("get DNS records by domain name: %v", err)
+		}
+		for _, rec := range recs {
+			switch {
+			case cfg.IPv4 && rec.Type == "A":
+				records4 = append(records4, rec.ID)
+				lastIPv4 = rec.Data
+			case cfg.IPv6 && rec.Type == "AAAA":
+				records6 = append(records6, rec.ID)
+				lastIPv6 = rec.Data
+			default:
+				continue
+			}
+			log.Printf("found %s record ID %d: %s", rec.Type, rec.ID, rec.Data)
+		}
+		if res.Links == nil || res.Links.IsLastPage() {
+			break
+		}
+		page, err := res.Links.CurrentPage()
+		if err != nil {
+			log.Fatalf("get current page: %v", err)
+		}
+		opt.Page = page + 1
 	}
-	if len(recs) == 0 {
-		log.Fatalf("no A record found for %s", fqdn)
+	if len(records4) == 0 && len(records6) == 0 {
+		log.Fatalf("no A or AAAA records found for %s", fqdn)
 	}
-	recID := recs[0].ID
-	log.Printf("found record %d for %s", recID, fqdn)
 
 	dur := time.Duration(float64(time.Second) * cfg.PeriodSeconds)
 	if dur < time.Second*5 {
-		log.Printf("warning: period %v too short", dur)
+		log.Printf("warning: period %v too short; increasing", dur)
 		dur = time.Minute * 15
 	}
 	log.Printf("period set to %s", dur)
 	ticker := time.NewTicker(dur)
 	for {
-		loopMain(client, cfg.Domain, cfg.Subdomain, recID)
+		loopMain(client, cfg.Domain, cfg.Subdomain, records4, records6)
 		<-ticker.C
 	}
 }
@@ -73,53 +105,80 @@ func mustReadFile(path string) []byte {
 	return b
 }
 
-var lastKnownIP string
+var lastIPv4, lastIPv6 string
 
-func loopMain(client *godo.Client, domain, subdomain string, recID int) {
-	ip, err := getPublicIP()
-	if err != nil {
-		log.Printf("error: get public IP address: %v", err)
-		return
-	}
-	if ip == lastKnownIP {
-		return
-	}
-	if lastKnownIP == "" {
-		log.Printf("public IP address: %s", ip)
-	} else {
-		log.Printf("public IP address changed from %s to %s", lastKnownIP, ip)
-	}
-	lastKnownIP = ip
-
-	ctx := context.Background()
-	_, _, err = client.Domains.EditRecord(ctx, domain, recID, &godo.DomainRecordEditRequest{
-		Type: "A",
-		Name: subdomain,
-		Data: ip,
+func loopMain(client *godo.Client, domain, subdomain string, records4, records6 []int) {
+	updateRecords(client, updateRecordsInput{
+		domain:             domain,
+		subdomain:          subdomain,
+		recordIDs:          records4,
+		recordType:         "A",
+		publicIPServiceURL: "https://api.ipify.org",
+		lastIP:             &lastIPv4,
 	})
-	if err != nil {
-		log.Printf("error: edit record: %v", err)
-		return
-	}
+	updateRecords(client, updateRecordsInput{
+		domain:             domain,
+		subdomain:          subdomain,
+		recordIDs:          records6,
+		recordType:         "AAAA",
+		publicIPServiceURL: "https://api6.ipify.org",
+		lastIP:             &lastIPv6,
+	})
 }
 
-func getPublicIP() (string, error) {
-	res, err := http.Get("http://ip-api.com/json?fields=query")
+type updateRecordsInput struct {
+	domain, subdomain  string
+	recordIDs          []int
+	recordType         string
+	lastIP             *string
+	publicIPServiceURL string
+}
+
+func updateRecords(client *godo.Client, in updateRecordsInput) {
+	if len(in.recordIDs) == 0 {
+		return
+	}
+	ip, err := getPublicIP(in.publicIPServiceURL)
+	if err != nil {
+		log.Printf("error: get public IP from %s: %v", in.publicIPServiceURL, err)
+		return
+	}
+	if ip == *in.lastIP {
+		return
+	}
+	log.Printf("public IP address changed from %s to %s", *in.lastIP, ip)
+	for _, recID := range in.recordIDs {
+		ctx := context.Background()
+		_, _, err := client.Domains.EditRecord(ctx, in.domain, recID, &godo.DomainRecordEditRequest{
+			Type: in.recordType,
+			Name: in.subdomain,
+			Data: ip,
+		})
+		if err != nil {
+			log.Printf("error: edit record: %v", err)
+			return
+		}
+	}
+	*in.lastIP = ip
+}
+
+func getPublicIP(serviceURL string) (string, error) {
+	res, err := http.Get(serviceURL)
 	if err != nil {
 		return "", fmt.Errorf("call IP service: %w", err)
 	}
 	defer res.Body.Close()
-	type ipRes struct {
-		Query string
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP status: %s", res.Status)
 	}
-	var ir ipRes
-	err = json.NewDecoder(res.Body).Decode(&ir)
+	b, err := io.ReadAll(res.Body)
 	if err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
+		return "", fmt.Errorf("read body: %w", err)
 	}
-	ip := net.ParseIP(ir.Query)
-	if ip == nil || ip.To4() == nil {
-		return "", fmt.Errorf("response did not have an IPv4 address: %q", ir.Query)
+	ipStr := string(b)
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return "", fmt.Errorf("response was not an IP address: %q", ipStr)
 	}
-	return ir.Query, nil
+	return ipStr, nil
 }
